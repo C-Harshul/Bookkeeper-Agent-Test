@@ -8,3 +8,4 @@ google-auth-oauthlib
 requests
 pydantic
 langchain-google-genai
+python-dotenv

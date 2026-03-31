@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 import requests
+from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.language_models import BaseChatModel
@@ -15,6 +16,8 @@ try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except ImportError:
     ChatGoogleGenerativeAI = None
+
+load_dotenv()
 
 
 class VendorRefModel(BaseModel):
@@ -95,9 +98,18 @@ class InvoicePayload(BaseModel):
     Line: List[InvoiceLine] = Field(default_factory=list)
 
 
-class AgentOutput(BaseModel):
+class ClassificationOutput(BaseModel):
     action: Literal["bill", "invoice", "no_action"] = "no_action"
+    rationale: Optional[str] = None
+
+
+class BillAgentOutput(BaseModel):
     bill: BillPayload = Field(default_factory=BillPayload)
+    duplicate_check: Dict[str, Any] = Field(default_factory=dict)
+    rationale: Optional[str] = None
+
+
+class InvoiceAgentOutput(BaseModel):
     invoice: InvoicePayload = Field(default_factory=InvoicePayload)
     duplicate_check: Dict[str, Any] = Field(default_factory=dict)
     rationale: Optional[str] = None
@@ -105,13 +117,16 @@ class AgentOutput(BaseModel):
 
 class GraphState(TypedDict, total=False):
     email: Dict[str, Any]
+    action: str
+    rationale: str
     bills: List[Dict[str, Any]]
     invoices: List[Dict[str, Any]]
     items: List[Dict[str, Any]]
     customers: List[Dict[str, Any]]
     vendors: List[Dict[str, Any]]
     accounts: List[Dict[str, Any]]
-    parsed: Dict[str, Any]
+    parsed_bill: Dict[str, Any]
+    parsed_invoice: Dict[str, Any]
     duplicate_found: bool
     result: Dict[str, Any]
 
@@ -277,8 +292,43 @@ def make_llm() -> BaseChatModel:
     return ChatOllama(**kwargs)
 
 
-def fetch_reference_data_node(state: GraphState) -> GraphState:
-    log_step("fetch_reference_data", "Fetching bills, invoices, items, customers, and vendors from QuickBooks")
+def classify_email_node(state: GraphState) -> GraphState:
+    log_step("classify_email", "Classifying incoming email as bill/invoice/no_action")
+    parser = PydanticOutputParser(pydantic_object=ClassificationOutput)
+    llm = make_llm()
+
+    email = state["email"]
+    email_blob = {
+        "subject": email.get("subject", ""),
+        "from": email.get("from", ""),
+        "date": email.get("date", ""),
+        "html": email.get("html", ""),
+        "text": email.get("text", ""),
+    }
+    response = llm.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You classify accounting emails.\n"
+                    "Return action in {'bill','invoice','no_action'} only.\n"
+                    "Use no_action for unrelated emails.\n"
+                    f"{parser.get_format_instructions()}"
+                )
+            ),
+            HumanMessage(content=json.dumps({"email": email_blob}, default=str)),
+        ]
+    )
+    classified = parser.parse(response.content)
+    log_step("classify_email", f"Classified action={classified.action}")
+    return {
+        **state,
+        "action": classified.action,
+        "rationale": classified.rationale or "",
+    }
+
+
+def fetch_bill_context_node(state: GraphState) -> GraphState:
+    log_step("fetch_bill_context", "Fetching vendors, items, accounts for bill processing")
     qb = QuickBooksClient(
         realm_id=os.environ["QB_REALM_ID"],
         access_token=os.environ["QB_ACCESS_TOKEN"],
@@ -286,29 +336,44 @@ def fetch_reference_data_node(state: GraphState) -> GraphState:
     )
     next_state = {
         **state,
-        "bills": qb.get_bills(),
-        "invoices": qb.get_invoices(),
         "items": qb.get_items(),
-        "customers": qb.get_customers(),
         "vendors": qb.get_vendors(),
         "accounts": qb.get_accounts(),
     }
     log_step(
-        "fetch_reference_data",
-        "Loaded reference data: "
-        f"bills={len(next_state['bills'])}, "
-        f"invoices={len(next_state['invoices'])}, "
+        "fetch_bill_context",
+        "Loaded bill context: "
         f"items={len(next_state['items'])}, "
-        f"customers={len(next_state['customers'])}, "
         f"vendors={len(next_state['vendors'])}, "
         f"accounts={len(next_state['accounts'])}",
     )
     return next_state
 
 
-def parse_email_node(state: GraphState) -> GraphState:
-    log_step("parse_email", "Running LLM extraction and classification")
-    parser = PydanticOutputParser(pydantic_object=AgentOutput)
+def fetch_invoice_context_node(state: GraphState) -> GraphState:
+    log_step("fetch_invoice_context", "Fetching customers and items for invoice processing")
+    qb = QuickBooksClient(
+        realm_id=os.environ["QB_REALM_ID"],
+        access_token=os.environ["QB_ACCESS_TOKEN"],
+        minor_version=os.getenv("QB_MINOR_VERSION", "69"),
+    )
+    next_state = {
+        **state,
+        "items": qb.get_items(),
+        "customers": qb.get_customers(),
+    }
+    log_step(
+        "fetch_invoice_context",
+        "Loaded invoice context: "
+        f"items={len(next_state['items'])}, "
+        f"customers={len(next_state['customers'])}",
+    )
+    return next_state
+
+
+def parse_bill_node(state: GraphState) -> GraphState:
+    log_step("parse_bill", "Running LLM bill extraction")
+    parser = PydanticOutputParser(pydantic_object=BillAgentOutput)
     llm = make_llm()
 
     email = state["email"]
@@ -321,15 +386,13 @@ def parse_email_node(state: GraphState) -> GraphState:
     }
 
     system_prompt = (
-        "You are an Accounting AI Agent. Determine whether an email represents a Bill, "
-        "an Invoice, or no action. Use the provided QuickBooks reference data.\n"
+        "You are an Accounting AI Agent for BILL extraction only.\n"
         "Rules:\n"
-        "1) Return action in {'bill','invoice','no_action'}.\n"
-        "2) Fill exactly one payload when action is bill/invoice.\n"
-        "3) For bill line details: if matching item has expense account use "
+        "1) Return only Bill fields in the schema.\n"
+        "2) For bill line details: if matching item has expense account use "
         "ItemBasedExpenseLineDetail, otherwise use AccountBasedExpenseLineDetail.\n"
-        "4) For invoice: use CustomerRef and SalesItemLineDetail ItemRef ids from references.\n"
-        "5) Include duplicate_check hints with keys helpful for comparison.\n"
+        "3) Use VendorRef from provided vendors.\n"
+        "4) Include duplicate_check hints with keys helpful for comparison.\n"
         f"{parser.get_format_instructions()}"
     )
 
@@ -337,7 +400,6 @@ def parse_email_node(state: GraphState) -> GraphState:
         "email": email_blob,
         "reference": {
             "items": state.get("items", []),
-            "customers": state.get("customers", []),
             "vendors": state.get("vendors", []),
             "accounts": state.get("accounts", []),
         },
@@ -350,67 +412,134 @@ def parse_email_node(state: GraphState) -> GraphState:
         ]
     )
     parsed = parser.parse(response.content)
-    log_step("parse_email", f"Model classified action={parsed.action}")
+    log_step("parse_bill", "Bill payload parsed")
 
     return {
         **state,
-        "parsed": parsed.model_dump(),
+        "parsed_bill": parsed.model_dump(),
     }
 
 
-def duplicate_check_node(state: GraphState) -> GraphState:
-    log_step("check_duplicate", "Checking for existing matching transactions")
-    parsed = state["parsed"]
-    action = parsed.get("action", "no_action")
+def parse_invoice_node(state: GraphState) -> GraphState:
+    log_step("parse_invoice", "Running LLM invoice extraction")
+    parser = PydanticOutputParser(pydantic_object=InvoiceAgentOutput)
+    llm = make_llm()
+
+    email = state["email"]
+    email_blob = {
+        "subject": email.get("subject", ""),
+        "from": email.get("from", ""),
+        "date": email.get("date", ""),
+        "html": email.get("html", ""),
+        "text": email.get("text", ""),
+    }
+
+    system_prompt = (
+        "You are an Accounting AI Agent for INVOICE extraction only.\n"
+        "Rules:\n"
+        "1) Return only Invoice fields in the schema.\n"
+        "2) Use CustomerRef from provided customers.\n"
+        "3) Use SalesItemLineDetail.ItemRef from provided items.\n"
+        "4) Include duplicate_check hints with keys helpful for comparison.\n"
+        f"{parser.get_format_instructions()}"
+    )
+
+    user_prompt = {
+        "email": email_blob,
+        "reference": {
+            "items": state.get("items", []),
+            "customers": state.get("customers", []),
+        },
+    }
+    response = llm.invoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(user_prompt, default=str)),
+        ]
+    )
+    parsed = parser.parse(response.content)
+    log_step("parse_invoice", "Invoice payload parsed")
+    return {**state, "parsed_invoice": parsed.model_dump()}
+
+
+def fetch_existing_bills_node(state: GraphState) -> GraphState:
+    log_step("fetch_existing_bills", "Fetching existing bills for duplicate check")
+    qb = QuickBooksClient(
+        realm_id=os.environ["QB_REALM_ID"],
+        access_token=os.environ["QB_ACCESS_TOKEN"],
+        minor_version=os.getenv("QB_MINOR_VERSION", "69"),
+    )
+    bills = qb.get_bills()
+    log_step("fetch_existing_bills", f"Fetched bills={len(bills)}")
+    return {**state, "bills": bills}
+
+
+def fetch_existing_invoices_node(state: GraphState) -> GraphState:
+    log_step("fetch_existing_invoices", "Fetching existing invoices for duplicate check")
+    qb = QuickBooksClient(
+        realm_id=os.environ["QB_REALM_ID"],
+        access_token=os.environ["QB_ACCESS_TOKEN"],
+        minor_version=os.getenv("QB_MINOR_VERSION", "69"),
+    )
+    invoices = qb.get_invoices()
+    log_step("fetch_existing_invoices", f"Fetched invoices={len(invoices)}")
+    return {**state, "invoices": invoices}
+
+
+def check_bill_duplicate_node(state: GraphState) -> GraphState:
+    log_step("check_bill_duplicate", "Checking duplicate bill")
+    bill = state.get("parsed_bill", {}).get("bill", {})
+    vendor = (bill.get("VendorRef") or {}).get("value")
+    txn_date = bill.get("TxnDate")
+    amount = sum((line or {}).get("Amount", 0) for line in bill.get("Line", []))
     duplicate = False
-
-    if action == "bill":
-        bill = parsed.get("bill", {})
-        vendor = (bill.get("VendorRef") or {}).get("value")
-        txn_date = bill.get("TxnDate")
-        amount = sum((line or {}).get("Amount", 0) for line in bill.get("Line", []))
-
-        for existing in state.get("bills", []):
-            same_vendor = ((existing.get("VendorRef") or {}).get("value") == vendor)
-            same_date = existing.get("TxnDate") == txn_date
-            existing_total = existing.get("TotalAmt")
-            same_amount = existing_total is not None and abs(float(existing_total) - float(amount)) < 0.01
-            if same_vendor and same_date and same_amount:
-                duplicate = True
-                break
-
-    elif action == "invoice":
-        invoice = parsed.get("invoice", {})
-        doc = invoice.get("DocNumber")
-        customer = (invoice.get("CustomerRef") or {}).get("value")
-        amount = sum((line or {}).get("Amount", 0) for line in invoice.get("Line", []))
-
-        for existing in state.get("invoices", []):
-            same_doc = existing.get("DocNumber") == doc if doc else False
-            same_customer = ((existing.get("CustomerRef") or {}).get("value") == customer)
-            existing_total = existing.get("TotalAmt")
-            same_amount = existing_total is not None and abs(float(existing_total) - float(amount)) < 0.01
-            if same_doc or (same_customer and same_amount):
-                duplicate = True
-                break
-
-    log_step("check_duplicate", f"Duplicate found={duplicate}")
+    for existing in state.get("bills", []):
+        same_vendor = ((existing.get("VendorRef") or {}).get("value") == vendor)
+        same_date = existing.get("TxnDate") == txn_date
+        existing_total = existing.get("TotalAmt")
+        same_amount = existing_total is not None and abs(float(existing_total) - float(amount)) < 0.01
+        if same_vendor and same_date and same_amount:
+            duplicate = True
+            break
+    log_step("check_bill_duplicate", f"Duplicate found={duplicate}")
     return {**state, "duplicate_found": duplicate}
 
 
-def route_action(state: GraphState) -> str:
-    parsed_action = state.get("parsed", {}).get("action", "no_action")
-    if state.get("duplicate_found"):
-        log_step("route_action", "Routing to no_action due to duplicate")
-        return "no_action"
-    if parsed_action == "bill":
-        log_step("route_action", "Routing to create_bill")
+def check_invoice_duplicate_node(state: GraphState) -> GraphState:
+    log_step("check_invoice_duplicate", "Checking duplicate invoice")
+    invoice = state.get("parsed_invoice", {}).get("invoice", {})
+    doc = invoice.get("DocNumber")
+    customer = (invoice.get("CustomerRef") or {}).get("value")
+    amount = sum((line or {}).get("Amount", 0) for line in invoice.get("Line", []))
+    duplicate = False
+    for existing in state.get("invoices", []):
+        same_doc = existing.get("DocNumber") == doc if doc else False
+        same_customer = ((existing.get("CustomerRef") or {}).get("value") == customer)
+        existing_total = existing.get("TotalAmt")
+        same_amount = existing_total is not None and abs(float(existing_total) - float(amount)) < 0.01
+        if same_doc or (same_customer and same_amount):
+            duplicate = True
+            break
+    log_step("check_invoice_duplicate", f"Duplicate found={duplicate}")
+    return {**state, "duplicate_found": duplicate}
+
+
+def route_from_classification(state: GraphState) -> str:
+    action = state.get("action", "no_action")
+    if action == "bill":
+        log_step("route_classification", "Routing to bill branch")
         return "bill"
-    if parsed_action == "invoice":
-        log_step("route_action", "Routing to create_invoice")
+    if action == "invoice":
+        log_step("route_classification", "Routing to invoice branch")
         return "invoice"
-    log_step("route_action", "Routing to no_action")
+    log_step("route_classification", "Routing to no_action")
     return "no_action"
+
+
+def route_after_duplicate(state: GraphState) -> str:
+    if state.get("duplicate_found"):
+        return "no_action"
+    return "create"
 
 
 def create_bill_node(state: GraphState) -> GraphState:
@@ -420,7 +549,7 @@ def create_bill_node(state: GraphState) -> GraphState:
         access_token=os.environ["QB_ACCESS_TOKEN"],
         minor_version=os.getenv("QB_MINOR_VERSION", "69"),
     )
-    payload = state["parsed"]["bill"]
+    payload = state["parsed_bill"]["bill"]
     accounts = state.get("accounts", [])
 
     default_expense_account_id = os.getenv("QB_DEFAULT_EXPENSE_ACCOUNT_ID", "").strip()
@@ -454,15 +583,15 @@ def create_invoice_node(state: GraphState) -> GraphState:
         access_token=os.environ["QB_ACCESS_TOKEN"],
         minor_version=os.getenv("QB_MINOR_VERSION", "69"),
     )
-    payload = state["parsed"]["invoice"]
+    payload = state["parsed_invoice"]["invoice"]
     result = qb.create_invoice(payload)
     log_step("create_invoice", f"Invoice created successfully. Response keys={list(result.keys())}")
     return {**state, "result": {"action": "invoice_created", "response": result}}
 
 
 def no_action_node(state: GraphState) -> GraphState:
-    parsed = state.get("parsed", {})
-    reason = "duplicate" if state.get("duplicate_found") else parsed.get("rationale", "no_action")
+    parsed = state.get("parsed_bill") or state.get("parsed_invoice") or {}
+    reason = "duplicate" if state.get("duplicate_found") else state.get("rationale", "no_action")
     log_step("no_action", f"No action taken. Reason={reason}")
     return {**state, "result": {"action": "no_action", "reason": reason, "parsed": parsed}}
 
@@ -470,9 +599,15 @@ def no_action_node(state: GraphState) -> GraphState:
 def build_graph():
     graph = StateGraph(GraphState)
     graph.add_node("inspect_email", inspect_email_node)
-    graph.add_node("fetch_reference_data", fetch_reference_data_node)
-    graph.add_node("parse_email", parse_email_node)
-    graph.add_node("check_duplicate", duplicate_check_node)
+    graph.add_node("classify_email", classify_email_node)
+    graph.add_node("fetch_bill_context", fetch_bill_context_node)
+    graph.add_node("parse_bill", parse_bill_node)
+    graph.add_node("fetch_existing_bills", fetch_existing_bills_node)
+    graph.add_node("check_bill_duplicate", check_bill_duplicate_node)
+    graph.add_node("fetch_invoice_context", fetch_invoice_context_node)
+    graph.add_node("parse_invoice", parse_invoice_node)
+    graph.add_node("fetch_existing_invoices", fetch_existing_invoices_node)
+    graph.add_node("check_invoice_duplicate", check_invoice_duplicate_node)
     graph.add_node("create_bill", create_bill_node)
     graph.add_node("create_invoice", create_invoice_node)
     graph.add_node("no_action", no_action_node)
@@ -481,18 +616,33 @@ def build_graph():
     graph.add_conditional_edges(
         "inspect_email",
         lambda state: "stop" if state.get("result", {}).get("action") == "no_action" else "continue",
-        {"stop": "no_action", "continue": "fetch_reference_data"},
+        {"stop": "no_action", "continue": "classify_email"},
     )
-    graph.add_edge("fetch_reference_data", "parse_email")
-    graph.add_edge("parse_email", "check_duplicate")
     graph.add_conditional_edges(
-        "check_duplicate",
-        route_action,
+        "classify_email",
+        route_from_classification,
         {
-            "bill": "create_bill",
-            "invoice": "create_invoice",
+            "bill": "fetch_bill_context",
+            "invoice": "fetch_invoice_context",
             "no_action": "no_action",
         },
+    )
+    graph.add_edge("fetch_bill_context", "parse_bill")
+    graph.add_edge("parse_bill", "fetch_existing_bills")
+    graph.add_edge("fetch_existing_bills", "check_bill_duplicate")
+    graph.add_conditional_edges(
+        "check_bill_duplicate",
+        route_after_duplicate,
+        {"create": "create_bill", "no_action": "no_action"},
+    )
+
+    graph.add_edge("fetch_invoice_context", "parse_invoice")
+    graph.add_edge("parse_invoice", "fetch_existing_invoices")
+    graph.add_edge("fetch_existing_invoices", "check_invoice_duplicate")
+    graph.add_conditional_edges(
+        "check_invoice_duplicate",
+        route_after_duplicate,
+        {"create": "create_invoice", "no_action": "no_action"},
     )
     graph.add_edge("create_bill", END)
     graph.add_edge("create_invoice", END)
@@ -520,15 +670,15 @@ if __name__ == "__main__":
             "Hello,\n"
             "Please record the following bill from Brosnahan Insurance Agency:\n"
             "Items Purchased:\n"
-            "- Liability Insurance (12 months @ $120 per month) - $1,440.00\n"
+            "- Liability Insurance (12 months @ $130 per month) - $1,560.00\n"
             "- Commercial Property Insurance - $900.00\n"
             "- Workers' Compensation Insurance - $500.00\n"
-            "Subtotal: $2,840.00\n"
-            "Tax (10%): $284.00\n"
-            "Total: $3,124.00\n"
+            "Subtotal: $2,960.00\n"
+            "Tax (10%): $296.00\n"
+            "Total: $3,256.00\n"
             "Payment Method: Credit Card\n"
-            "Bill Date: March 30, 2026\n"
-            "Due Date: April 15, 2026\n"
+            "Bill Date: April 1, 2026\n"
+            "Due Date: April 20, 2026\n"
             "Category: Insurance\n"
             "Vendor: Brosnahan Insurance Agency\n"
             "Regards,\n"
