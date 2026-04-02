@@ -9,3 +9,5 @@ requests
 pydantic
 langchain-google-genai
 python-dotenv
+fastapi
+uvicorn

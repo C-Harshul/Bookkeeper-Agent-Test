@@ -40,6 +40,14 @@ export OLLAMA_BASE_URL="http://localhost:11434"
 python main.py
 ```
 
+## 4) Run backend API for frontend execution
+
+```bash
+uvicorn backend.api:app --reload --port 8000
+```
+
+The frontend (`Accounting-Orchestrator`) calls `POST /run-workflow` to execute the graph order defined by current UI nodes/edges.
+
 ## Mapping from n8n to LangGraph
 
 - `Gmail Trigger` -> provide `email_payload` to `run_once(...)`
