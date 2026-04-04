@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Literal, Optional
 
 import json
@@ -13,6 +14,7 @@ from backend.config import get_env
 from backend.executor import execute_workflow_from_graph, stream_workflow_from_graph
 from backend.models import GraphState
 from backend.sample import get_sample_email
+from backend.services import gmail as gmail_service
 from backend.services.quickbooks import exchange_authorization_code, get_qb_client
 
 
@@ -28,8 +30,19 @@ class FrontendEdge(BaseModel):
 
 
 class RunWorkflowRequest(BaseModel):
-    scenario: Literal["bill", "invoice", "no_action"] = "bill"
+    scenario: Literal["bill", "invoice", "no_action"] = Field(
+        default="bill",
+        description="When classification_mode is scenario, this action is used instead of the LLM.",
+    )
+    classification_mode: Literal["llm", "scenario"] = Field(
+        default="llm",
+        description="llm: classify with LLM. scenario: use scenario field (simulate path).",
+    )
     email: Optional[Dict[str, Any]] = None
+    emailSource: Literal["sample", "gmail_latest"] = Field(
+        default="sample",
+        description="gmail_latest: newest INBOX message via Gmail API (requires OAuth).",
+    )
     nodes: List[FrontendNode] = Field(default_factory=list)
     edges: List[FrontendEdge] = Field(default_factory=list)
     entryNodeId: Optional[str] = None
@@ -39,6 +52,61 @@ class OAuthCallbackExchangeRequest(BaseModel):
     code: str
     realmId: Optional[str] = None
     redirectUri: Optional[str] = None
+
+
+class GmailOAuthCallbackExchangeRequest(BaseModel):
+    code: str
+    redirectUri: Optional[str] = None
+
+
+def _resolve_workflow_email(payload: RunWorkflowRequest) -> Dict[str, Any]:
+    if payload.email is not None:
+        return payload.email
+    if payload.emailSource == "sample":
+        return get_sample_email()
+
+    if not gmail_service.gmail_oauth_configured():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GMAIL_NOT_CONFIGURED",
+                "message": (
+                    "Gmail OAuth is not configured. Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, "
+                    "and GMAIL_REDIRECT_URI in the backend environment."
+                ),
+            },
+        )
+
+    if not gmail_service.gmail_tokens_present():
+        try:
+            authorize_url = gmail_service.build_gmail_authorize_url()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "GMAIL_NOT_CONFIGURED", "message": str(exc)},
+            ) from exc
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "GMAIL_NOT_CONNECTED",
+                "message": "Gmail is not connected. Complete the OAuth flow to grant inbox read access.",
+                "authorizeUrl": authorize_url,
+            },
+        )
+
+    try:
+        return gmail_service.fetch_latest_inbox_message_as_email()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "GMAIL_NO_MESSAGES", "message": str(exc)},
+        ) from exc
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "GMAIL_API_ERROR", "message": str(exc)},
+        ) from exc
 
 
 app = FastAPI(title="Numina Reconcile Backend API")
@@ -138,6 +206,106 @@ def quickbooks_callback_exchange(payload: OAuthCallbackExchangeRequest) -> Dict[
     }
 
 
+@app.get("/oauth/gmail/status")
+def gmail_oauth_status() -> Dict[str, Any]:
+    urls = gmail_service.gmail_public_oauth_urls()
+    return {
+        "oauthConfigured": gmail_service.gmail_oauth_configured(),
+        "tokensPresent": gmail_service.gmail_tokens_present(),
+        "redirectUri": urls["redirectUri"],
+        "javascriptOrigin": urls["javascriptOrigin"],
+    }
+
+
+@app.get("/oauth/gmail/authorize-url")
+def gmail_authorize_url(login_hint: Optional[str] = None) -> Dict[str, str]:
+    try:
+        return {
+            "authorizeUrl": gmail_service.build_gmail_authorize_url(
+                login_hint=(login_hint or "").strip(),
+            )
+        }
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "GMAIL_NOT_CONFIGURED", "message": str(exc)},
+        ) from exc
+
+
+@app.post("/oauth/gmail/callback-exchange")
+def gmail_callback_exchange(payload: GmailOAuthCallbackExchangeRequest) -> Dict[str, Any]:
+    redirect_uri = (payload.redirectUri or os.getenv("GMAIL_REDIRECT_URI") or "").strip()
+    if not redirect_uri:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "GMAIL_NOT_CONFIGURED", "message": "GMAIL_REDIRECT_URI is not set."},
+        )
+    try:
+        token_data = gmail_service.exchange_gmail_authorization_code(payload.code, redirect_uri)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        detail = exc.response.text if exc.response is not None else str(exc)
+        raise HTTPException(
+            status_code=status_code,
+            detail={"message": detail, "code": "GMAIL_OAUTH_EXCHANGE_FAILED"},
+        ) from exc
+
+    return {
+        "ok": True,
+        "accessTokenPresent": bool(token_data.get("access_token")),
+        "refreshTokenPresent": bool(token_data.get("refresh_token")),
+    }
+
+
+@app.post("/oauth/gmail/enable")
+def enable_gmail_oauth() -> Dict[str, Any]:
+    if not gmail_service.gmail_oauth_configured():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GMAIL_NOT_CONFIGURED",
+                "message": "Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REDIRECT_URI in .env.",
+            },
+        )
+    if not gmail_service.gmail_tokens_present():
+        try:
+            authorize_url = gmail_service.build_gmail_authorize_url()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "GMAIL_NOT_CONFIGURED", "message": str(exc)},
+            ) from exc
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "GMAIL_NOT_CONNECTED",
+                "message": "Gmail tokens missing. Authorize read-only inbox access.",
+                "authorizeUrl": authorize_url,
+            },
+        )
+    try:
+        profile = gmail_service.validate_gmail_auth()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        detail = str(exc)
+        if status_code == 401:
+            try:
+                authorize_url = gmail_service.build_gmail_authorize_url()
+            except ValueError:
+                authorize_url = ""
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "message": detail,
+                    "code": "GMAIL_TOKEN_EXPIRED",
+                    "authorizeUrl": authorize_url,
+                },
+            ) from exc
+        raise HTTPException(status_code=status_code, detail={"message": detail}) from exc
+
+    return {"enabled": True, "emailAddress": profile.get("emailAddress", "")}
+
+
 @app.post("/oauth/quickbooks/enable")
 def enable_quickbooks_oauth() -> Dict[str, Any]:
     required_nodes = [
@@ -173,10 +341,13 @@ def enable_quickbooks_oauth() -> Dict[str, Any]:
 
 @app.post("/run-workflow")
 def run_workflow(payload: RunWorkflowRequest) -> Dict[str, Any]:
-    # Frontend can send custom email; fallback to sample.
-    email_payload = payload.email or get_sample_email()
+    email_payload = _resolve_workflow_email(payload)
 
-    state: GraphState = {"email": email_payload}
+    state: GraphState = {
+        "email": email_payload,
+        "classification_mode": payload.classification_mode,
+        "forced_scenario": payload.scenario if payload.classification_mode == "scenario" else "",
+    }
     try:
         final_state, execution_order, node_logs = execute_workflow_from_graph(
             nodes=[node.model_dump() for node in payload.nodes],
@@ -212,8 +383,12 @@ def run_workflow(payload: RunWorkflowRequest) -> Dict[str, Any]:
 
 @app.post("/run-workflow/stream")
 def run_workflow_stream(payload: RunWorkflowRequest) -> StreamingResponse:
-    email_payload = payload.email or get_sample_email()
-    state: GraphState = {"email": email_payload}
+    email_payload = _resolve_workflow_email(payload)
+    state: GraphState = {
+        "email": email_payload,
+        "classification_mode": payload.classification_mode,
+        "forced_scenario": payload.scenario if payload.classification_mode == "scenario" else "",
+    }
 
     def event_stream():
         try:

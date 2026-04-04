@@ -100,6 +100,8 @@ class InvoiceAgentOutput(BaseModel):
 
 class GraphState(TypedDict, total=False):
     email: Dict[str, Any]
+    classification_mode: str
+    forced_scenario: str
     action: str
     rationale: str
     bills: List[Dict[str, Any]]

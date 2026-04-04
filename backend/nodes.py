@@ -50,7 +50,12 @@ def inspect_email_node(state: GraphState) -> GraphState:
 
 
 def classify_email_node(state: GraphState) -> GraphState:
-    log_step("classify_email", "Classifying incoming email as bill/invoice/no_action")
+    forced = (state.get("forced_scenario") or "").strip().lower()
+    if state.get("classification_mode") == "scenario" and forced in ("bill", "invoice", "no_action"):
+        log_step("classify_email", f"Using forced scenario (no LLM): action={forced}")
+        return {**state, "action": forced, "rationale": "forced_scenario"}
+
+    log_step("classify_email", "Classifying incoming email as bill/invoice/no_action (LLM)")
     parser = PydanticOutputParser(pydantic_object=ClassificationOutput)
     email_blob = build_email_blob(state["email"])
     system_prompt = (
@@ -112,7 +117,21 @@ def parse_bill_node(state: GraphState) -> GraphState:
         "2) For bill line details: if matching item has expense account use "
         "ItemBasedExpenseLineDetail, otherwise use AccountBasedExpenseLineDetail.\n"
         "3) Use VendorRef from provided vendors.\n"
-        "4) Include duplicate_check hints with keys helpful for comparison.\n"
+        "4) Tax, VAT, GST, and sales tax: If the email shows a separate tax amount (e.g. "
+        "'Tax (10%): $296', 'VAT: …', 'Sales tax …'), add a separate Line with "
+        "DetailType AccountBasedExpenseLineDetail, Description matching the email "
+        "(e.g. 'Sales tax (10%)'), Amount equal to that tax dollar amount, "
+        "TaxCodeRef value 'NON', and AccountRef from a suitable expense or tax account "
+        "in reference.accounts when possible; otherwise any plausible expense AccountRef id.\n"
+        "5) Subtotal vs total: If the email gives Subtotal and Tax and Total, line items "
+        "should sum to subtotal (pre-tax) and the tax line equals the stated tax; "
+        "sum of all Line.Amount must equal the email Total (within $0.02). "
+        "If items are clearly tax-inclusive only, omit a separate tax line and note in rationale.\n"
+        "6) Shipping or other fees: If the email lists separate dollar amounts, add "
+        "AccountBasedExpenseLineDetail lines with matching Amounts.\n"
+        "7) duplicate_check must include when present: subtotal, tax, total (numbers) "
+        "from the email for reconciliation.\n"
+        "8) Include other duplicate_check hints helpful for comparison.\n"
         f"{parser.get_format_instructions()}"
     )
 
@@ -141,7 +160,15 @@ def parse_invoice_node(state: GraphState) -> GraphState:
         "1) Return only Invoice fields in the schema.\n"
         "2) Use CustomerRef from provided customers.\n"
         "3) Use SalesItemLineDetail.ItemRef from provided items.\n"
-        "4) Include duplicate_check hints with keys helpful for comparison.\n"
+        "4) Tax / VAT / GST: If the email shows tax as a separate amount, add a Line: "
+        "use a reference item that represents tax/fees if one exists; otherwise pick the "
+        "closest generic item and set Description to the tax label from the email "
+        "(e.g. 'Sales tax 10%') and Amount to the tax dollar amount so Line amounts "
+        "sum to the invoice Total. If line prices are tax-inclusive, do not add a "
+        "separate tax line; note in rationale.\n"
+        "5) Subtotal, tax, total: duplicate_check must include subtotal, tax, total "
+        "when the email states them; sum(Line.Amount) should match stated Total.\n"
+        "6) Include other duplicate_check hints helpful for comparison.\n"
         f"{parser.get_format_instructions()}"
     )
 
