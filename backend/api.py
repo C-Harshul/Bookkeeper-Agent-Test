@@ -378,6 +378,8 @@ def run_workflow(payload: RunWorkflowRequest) -> Dict[str, Any]:
         "result": final_state.get("result", {"action": "no_action", "reason": "empty_result"}),
         "executionOrder": execution_order,
         "nodeLogs": node_logs,
+        "workflowFailed": bool(final_state.get("workflow_failed")),
+        "workflowFailureReason": final_state.get("workflow_failure_reason", ""),
     }
 
 

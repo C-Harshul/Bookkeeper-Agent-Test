@@ -11,10 +11,14 @@ from backend.models import (
 from backend.services.llm import parse_structured_output
 from backend.services.quickbooks import get_qb_client
 from backend.utils import (
+    build_bill_payload_from_email,
     build_email_blob,
+    build_invoice_payload_from_email,
     detect_bill_duplicate,
     detect_invoice_duplicate,
+    get_email_body_text,
     log_step,
+    quick_classify_email_body,
     sanitize_bill_payload,
     should_track_email,
     summarize_counts,
@@ -55,6 +59,13 @@ def classify_email_node(state: GraphState) -> GraphState:
         log_step("classify_email", f"Using forced scenario (no LLM): action={forced}")
         return {**state, "action": forced, "rationale": "forced_scenario"}
 
+    body_text = get_email_body_text(state["email"])
+    quick = quick_classify_email_body(body_text)
+    if quick:
+        action, rationale = quick
+        log_step("classify_email", f"Quick body classify: action={action}")
+        return {**state, "action": action, "rationale": rationale}
+
     log_step("classify_email", "Classifying incoming email as bill/invoice/no_action (LLM)")
     parser = PydanticOutputParser(pydantic_object=ClassificationOutput)
     email_blob = build_email_blob(state["email"])
@@ -62,13 +73,23 @@ def classify_email_node(state: GraphState) -> GraphState:
         "You classify accounting emails.\n"
         "Return action in {'bill','invoice','no_action'} only.\n"
         "Use no_action for unrelated emails.\n"
+        "Prefer 'bill' for amounts owed to suppliers/vendors (accounts payable). "
+        "Prefer 'invoice' for sales/customer-facing invoices (accounts receivable).\n"
         f"{parser.get_format_instructions()}"
     )
-    classified = parse_structured_output(
-        parser=parser,
-        system_prompt=system_prompt,
-        user_payload={"email": email_blob},
-    )
+    try:
+        classified = parse_structured_output(
+            parser=parser,
+            system_prompt=system_prompt,
+            user_payload={"email": email_blob, "email_body_text": body_text},
+        )
+    except Exception as exc:
+        log_step("classify_email", f"Classification failed: {exc}")
+        return {
+            **state,
+            "action": "no_action",
+            "rationale": f"classification_error:{exc}",
+        }
     log_step("classify_email", f"Classified action={classified.action}")
     return {
         **state,
@@ -109,6 +130,7 @@ def parse_bill_node(state: GraphState) -> GraphState:
     log_step("parse_bill", "Running LLM bill extraction")
     parser = PydanticOutputParser(pydantic_object=BillAgentOutput)
     email_blob = build_email_blob(state["email"])
+    email_body_text = get_email_body_text(state["email"])
 
     system_prompt = (
         "You are an Accounting AI Agent for BILL extraction only.\n"
@@ -117,26 +139,28 @@ def parse_bill_node(state: GraphState) -> GraphState:
         "2) For bill line details: if matching item has expense account use "
         "ItemBasedExpenseLineDetail, otherwise use AccountBasedExpenseLineDetail.\n"
         "3) Use VendorRef from provided vendors.\n"
-        "4) Tax, VAT, GST, and sales tax: If the email shows a separate tax amount (e.g. "
+        "4) Use email_body_text for line items and amounts when the structured email fields are sparse.\n"
+        "5) Tax, VAT, GST, and sales tax: If the email shows a separate tax amount (e.g. "
         "'Tax (10%): $296', 'VAT: …', 'Sales tax …'), add a separate Line with "
         "DetailType AccountBasedExpenseLineDetail, Description matching the email "
         "(e.g. 'Sales tax (10%)'), Amount equal to that tax dollar amount, "
         "TaxCodeRef value 'NON', and AccountRef from a suitable expense or tax account "
         "in reference.accounts when possible; otherwise any plausible expense AccountRef id.\n"
-        "5) Subtotal vs total: If the email gives Subtotal and Tax and Total, line items "
+        "6) Subtotal vs total: If the email gives Subtotal and Tax and Total, line items "
         "should sum to subtotal (pre-tax) and the tax line equals the stated tax; "
         "sum of all Line.Amount must equal the email Total (within $0.02). "
         "If items are clearly tax-inclusive only, omit a separate tax line and note in rationale.\n"
-        "6) Shipping or other fees: If the email lists separate dollar amounts, add "
+        "7) Shipping or other fees: If the email lists separate dollar amounts, add "
         "AccountBasedExpenseLineDetail lines with matching Amounts.\n"
-        "7) duplicate_check must include when present: subtotal, tax, total (numbers) "
+        "8) duplicate_check must include when present: subtotal, tax, total (numbers) "
         "from the email for reconciliation.\n"
-        "8) Include other duplicate_check hints helpful for comparison.\n"
+        "9) Include other duplicate_check hints helpful for comparison.\n"
         f"{parser.get_format_instructions()}"
     )
 
     user_prompt = {
         "email": email_blob,
+        "email_body_text": email_body_text,
         "reference": {
             "items": state.get("items", []),
             "vendors": state.get("vendors", []),
@@ -145,14 +169,22 @@ def parse_bill_node(state: GraphState) -> GraphState:
     }
 
     parsed = parse_structured_output(parser=parser, system_prompt=system_prompt, user_payload=user_prompt)
+    merged = build_bill_payload_from_email(
+        state["email"],
+        parsed.model_dump(),
+        items=state.get("items", []),
+        vendors=state.get("vendors", []),
+        accounts=state.get("accounts", []),
+    )
     log_step("parse_bill", "Bill payload parsed")
-    return {**state, "parsed_bill": parsed.model_dump()}
+    return {**state, "parsed_bill": merged}
 
 
 def parse_invoice_node(state: GraphState) -> GraphState:
     log_step("parse_invoice", "Running LLM invoice extraction")
     parser = PydanticOutputParser(pydantic_object=InvoiceAgentOutput)
     email_blob = build_email_blob(state["email"])
+    email_body_text = get_email_body_text(state["email"])
 
     system_prompt = (
         "You are an Accounting AI Agent for INVOICE extraction only.\n"
@@ -160,28 +192,36 @@ def parse_invoice_node(state: GraphState) -> GraphState:
         "1) Return only Invoice fields in the schema.\n"
         "2) Use CustomerRef from provided customers.\n"
         "3) Use SalesItemLineDetail.ItemRef from provided items.\n"
-        "4) Tax / VAT / GST: If the email shows tax as a separate amount, add a Line: "
+        "4) Use email_body_text for line items and amounts when the structured email fields are sparse.\n"
+        "5) Tax / VAT / GST: If the email shows tax as a separate amount, add a Line: "
         "use a reference item that represents tax/fees if one exists; otherwise pick the "
         "closest generic item and set Description to the tax label from the email "
         "(e.g. 'Sales tax 10%') and Amount to the tax dollar amount so Line amounts "
         "sum to the invoice Total. If line prices are tax-inclusive, do not add a "
         "separate tax line; note in rationale.\n"
-        "5) Subtotal, tax, total: duplicate_check must include subtotal, tax, total "
+        "6) Subtotal, tax, total: duplicate_check must include subtotal, tax, total "
         "when the email states them; sum(Line.Amount) should match stated Total.\n"
-        "6) Include other duplicate_check hints helpful for comparison.\n"
+        "7) Include other duplicate_check hints helpful for comparison.\n"
         f"{parser.get_format_instructions()}"
     )
 
     user_prompt = {
         "email": email_blob,
+        "email_body_text": email_body_text,
         "reference": {
             "items": state.get("items", []),
             "customers": state.get("customers", []),
         },
     }
     parsed = parse_structured_output(parser=parser, system_prompt=system_prompt, user_payload=user_prompt)
+    merged = build_invoice_payload_from_email(
+        state["email"],
+        parsed.model_dump(),
+        items=state.get("items", []),
+        customers=state.get("customers", []),
+    )
     log_step("parse_invoice", "Invoice payload parsed")
-    return {**state, "parsed_invoice": parsed.model_dump()}
+    return {**state, "parsed_invoice": merged}
 
 
 def fetch_existing_bills_node(state: GraphState) -> GraphState:

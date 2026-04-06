@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from backend.graph import NODE_REGISTRY
 from backend.models import GraphState
+from backend.utils import build_email_blob, get_email_body_text
 
 
 def _timestamp() -> str:
@@ -88,11 +89,57 @@ def _choose_next_edge(current: str, outgoing: List[Dict[str, Any]], state: Graph
     return sorted(outgoing, key=lambda edge: str(edge.get("target", "")))[0]
 
 
-def _trim_output(value: Any, max_chars: int = 3000) -> Any:
-    text = str(value)
-    if len(text) <= max_chars:
+def _trim_output(value: Any, max_chars: int = 120_000) -> Any:
+    if not isinstance(value, str):
         return value
-    return f"{text[:max_chars]}...<truncated>"
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}...<truncated>"
+
+
+def _extract_node_input(base: str, state: GraphState) -> Dict[str, Any]:
+    email = state.get("email", {})
+    if base == "inspect_email":
+        return {"email": email}
+    if base == "classify_email":
+        return {"email": build_email_blob(email), "email_body_text": get_email_body_text(email)}
+    if base == "fetch_bill_context":
+        return {}
+    if base == "fetch_invoice_context":
+        return {}
+    if base == "parse_bill":
+        body = get_email_body_text(email) or ""
+        return {
+            "email_body_preview": body[:800],
+            "items_count": len(state.get("items", [])),
+            "vendors_count": len(state.get("vendors", [])),
+            "accounts_count": len(state.get("accounts", [])),
+        }
+    if base == "parse_invoice":
+        body = get_email_body_text(email) or ""
+        return {
+            "email_body_preview": body[:800],
+            "items_count": len(state.get("items", [])),
+            "customers_count": len(state.get("customers", [])),
+        }
+    if base == "fetch_existing_bills":
+        return {}
+    if base == "fetch_existing_invoices":
+        return {}
+    if base == "check_bill_duplicate":
+        return {"parsed_bill": state.get("parsed_bill", {})}
+    if base == "check_invoice_duplicate":
+        return {"parsed_invoice": state.get("parsed_invoice", {})}
+    if base == "create_bill":
+        return {"parsed_bill": state.get("parsed_bill", {})}
+    if base == "create_invoice":
+        return {"parsed_invoice": state.get("parsed_invoice", {})}
+    if base == "no_action":
+        return {
+            "duplicate_found": state.get("duplicate_found"),
+            "rationale": state.get("rationale"),
+        }
+    return {}
 
 
 def _extract_node_output(base: str, state: GraphState) -> Dict[str, Any]:
@@ -160,7 +207,18 @@ def execute_workflow_from_graph(
         else:
             start = {"timestamp": _timestamp(), "level": "INFO", "message": f"Executing {base}"}
             node_logs.setdefault(current, []).append(start)
-            state = handler(state)
+            try:
+                state = handler(state)
+            except Exception as exc:
+                state = {
+                    **state,
+                    "workflow_failed": True,
+                    "workflow_failure_reason": f"{base}: {exc}",
+                }
+                err = {"timestamp": _timestamp(), "level": "ERROR", "message": str(exc)}
+                node_logs.setdefault(current, []).append(err)
+                execution_order.append({"nodeId": current, "status": "failed"})
+                break
             done = {"timestamp": _timestamp(), "level": "SUCCESS", "message": f"Completed {base}"}
             node_logs.setdefault(current, []).append(done)
             execution_order.append({"nodeId": current, "status": "done"})
@@ -173,7 +231,12 @@ def execute_workflow_from_graph(
         if state.get("result", {}).get("action") and _base_node_id(current or "") in {"", "no_action"} and not outgoing:
             break
 
-    if step_count >= max_steps:
+    if step_count >= max_steps and not state.get("workflow_failed"):
+        state = {
+            **state,
+            "workflow_failed": True,
+            "workflow_failure_reason": f"Execution exceeded max_steps={max_steps}",
+        }
         execution_order.append({"nodeId": "__system__", "status": "max_steps_reached"})
 
     return state, execution_order, node_logs
@@ -207,13 +270,31 @@ def stream_workflow_from_graph(
                 "log": {"level": "DEBUG", "message": f"Skipped unknown node: {current}"},
             }
         else:
+            node_input = _extract_node_input(base, state)
             yield {
                 "event": "node_start",
                 "timestamp": _timestamp(),
                 "nodeId": current,
                 "log": {"level": "INFO", "message": f"Executing {base}"},
+                "input": node_input,
             }
-            state = handler(state)
+            try:
+                state = handler(state)
+            except Exception as exc:
+                state = {
+                    **state,
+                    "workflow_failed": True,
+                    "workflow_failure_reason": f"{base}: {exc}",
+                }
+                yield {
+                    "event": "node_failed",
+                    "timestamp": _timestamp(),
+                    "nodeId": current,
+                    "log": {"level": "ERROR", "message": f"Failed {base}: {exc}"},
+                    "input": node_input,
+                    "error": str(exc),
+                }
+                break
             yield {
                 "event": "node_done",
                 "timestamp": _timestamp(),
@@ -232,6 +313,12 @@ def stream_workflow_from_graph(
         current = str(next_edge.get("target")) if next_edge else None
 
     if step_count >= max_steps:
+        if not state.get("workflow_failed"):
+            state = {
+                **state,
+                "workflow_failed": True,
+                "workflow_failure_reason": f"Execution exceeded max_steps={max_steps}",
+            }
         yield {
             "event": "workflow_error",
             "timestamp": _timestamp(),
@@ -242,5 +329,7 @@ def stream_workflow_from_graph(
         "event": "workflow_complete",
         "timestamp": _timestamp(),
         "result": state.get("result", {"action": "no_action", "reason": "empty_result"}),
+        "workflowFailed": bool(state.get("workflow_failed")),
+        "workflowFailureReason": state.get("workflow_failure_reason", ""),
     }
 

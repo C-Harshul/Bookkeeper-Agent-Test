@@ -114,4 +114,6 @@ class GraphState(TypedDict, total=False):
     parsed_invoice: Dict[str, Any]
     duplicate_found: bool
     result: Dict[str, Any]
+    workflow_failed: bool
+    workflow_failure_reason: str
 
