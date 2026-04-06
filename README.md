@@ -8,7 +8,7 @@ LangGraph workflow that ingests email-like payloads, classifies them as **bill**
 |------|---------|
 | `backend/` | LangGraph nodes, QuickBooks + Gmail services, FastAPI API |
 | `main.py` | CLI: runs sample email through `run_once()` |
-| `Accounting-Orchestrator/` | React + Vite + React Flow UI (live streaming runs, OAuth sidebars) |
+| `Accounting-Orchestrator/` | React + Vite + React Flow UI (live streaming runs, OAuth sidebars); **nested git repo** — if the folder is empty after clone, run `git submodule update --init --recursive` (or `cd Accounting-Orchestrator && git fetch && git checkout` the commit shown by `git ls-tree HEAD Accounting-Orchestrator` in the parent repo). |
 | `.env.example` | Template for environment variables (copy to `.env`) |
 
 ## 1) Python backend
@@ -35,6 +35,7 @@ Create `.env` in the **project root** (same folder as `backend/` and `main.py`).
 | `QB_REDIRECT_URI` | Must match Intuit app (e.g. `http://localhost:5173/callback`) |
 | `QB_MINOR_VERSION` | API minor version (default `69`) |
 | `QB_DEFAULT_EXPENSE_ACCOUNT_ID` | Optional: default account id for bill lines missing `AccountRef` |
+| `QB_DEFAULT_INVOICE_ITEM_ID` | Optional: preferred QuickBooks **Item** id for invoice lines built from the email body (must not be a Category-type item) |
 | `LLM_PROVIDER` | `gemini` or `ollama` |
 | `GOOGLE_API_KEY` | Required if `LLM_PROVIDER=gemini` |
 | `GEMINI_MODEL` | e.g. `gemini-2.5-flash` |
@@ -81,7 +82,7 @@ python main.py
 uvicorn backend.api:app --reload --port 8000
 ```
 
-**Endpoints (summary):** `GET /health`, QuickBooks `GET/POST /oauth/quickbooks/*`, Gmail `GET/POST /oauth/gmail/*`, `POST /run-workflow`, `POST /run-workflow/stream` (NDJSON).
+**Endpoints (summary):** `GET /health`, QuickBooks `GET/POST /oauth/quickbooks/*`, Gmail `GET/POST /oauth/gmail/*`, `POST /run-workflow`, `POST /run-workflow/stream` (NDJSON). Non-stream responses include `workflowFailed` / `workflowFailureReason` when a node raises or the run hits `max_steps`.
 
 ## 2) Frontend (`Accounting-Orchestrator`)
 
@@ -101,10 +102,12 @@ Match **ports** in Intuit app, Google Console, `GMAIL_REDIRECT_URI`, and the URL
 ## 3) Workflow behavior (high level)
 
 1. **Inspect email** — optional filter via `TRACK_EMAIL`; with Gmail, payload is latest INBOX message.
-2. **Classify** — LLM (or forced scenario from toolbar).
+2. **Classify** — if the plain-text body clearly looks like a **vendor bill** or **customer invoice**, that wins without calling the LLM; otherwise LLM (or **forced scenario** from the toolbar).
 3. **Branch**
-   - **Bill:** fetch vendors, items, accounts → **parse bill** (LLM) → existing bills → duplicate check → create bill.
-   - **Invoice:** fetch customers, items → **parse invoice** → existing invoices → duplicate check → create invoice.
+   - **Bill:** fetch vendors, items, accounts → **parse bill** (LLM + merge) → existing bills → duplicate check → create bill.
+   - **Invoice:** fetch customers, items → **parse invoice** (LLM + merge) → existing invoices → duplicate check → create invoice.
+
+**Parse merge (after the LLM):** vendor/customer refs and dates are reconciled from the email body when missing; labeled **Subtotal / Tax / Total** lines fill `duplicate_check` when the model omitted them. If the model returns **no line items** but the body lists amounts, lines are built from the body (QuickBooks **items** when possible, else expense **accounts**). Body parsing skips header/summary lines, so when **subtotal + tax = total** is present in the body, a **tax line** may be appended automatically for that fallback path.
 
 ### Bill / invoice extraction (tax and totals)
 

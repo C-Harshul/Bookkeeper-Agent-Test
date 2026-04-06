@@ -627,6 +627,96 @@ def _extract_amount_hints_from_body(email_text: str) -> Dict[str, Any]:
     return hints
 
 
+def _line_sum_amounts(lines: List[Dict[str, Any]]) -> float:
+    return sum(float((line or {}).get("Amount", 0) or 0) for line in lines)
+
+
+def _description_suggests_tax_line(desc: str) -> bool:
+    d = desc.lower().strip()
+    if not d:
+        return False
+    return bool(re.match(r"^(tax|vat|gst|sales\s+tax)\b", d) or re.search(r"\b(sales\s+tax|vat|gst)\b", d))
+
+
+def _bill_has_separate_tax_line(lines: List[Dict[str, Any]]) -> bool:
+    for line in lines:
+        if _description_suggests_tax_line(str((line or {}).get("Description") or "")):
+            return True
+    return False
+
+
+def _append_bill_tax_line_from_hints(
+    bill: Dict[str, Any],
+    duplicate_check: Dict[str, Any],
+    account_ref: Dict[str, str],
+) -> None:
+    lines = list(bill.get("Line") or [])
+    if not lines:
+        return
+    tax_raw = duplicate_check.get("tax")
+    total_raw = duplicate_check.get("total")
+    sub_raw = duplicate_check.get("subtotal")
+    if tax_raw is None or total_raw is None:
+        return
+    try:
+        tax_amt = float(tax_raw)
+        total_amt = float(total_raw)
+    except (TypeError, ValueError):
+        return
+    if tax_amt <= 0 or total_amt <= 0:
+        return
+    if _bill_has_separate_tax_line(lines):
+        return
+    line_sum = _line_sum_amounts(lines)
+    if sub_raw is not None:
+        try:
+            sub_amt = float(sub_raw)
+        except (TypeError, ValueError):
+            sub_amt = line_sum
+        if abs(line_sum - sub_amt) > 0.06:
+            return
+    if abs(line_sum + tax_amt - total_amt) > 0.06:
+        return
+    lines.append(_as_account_line("Sales tax (from email)", tax_amt, account_ref))
+    bill["Line"] = lines
+
+
+def _append_invoice_tax_line_from_hints(
+    inv: Dict[str, Any],
+    duplicate_check: Dict[str, Any],
+    default_item: Dict[str, str],
+) -> None:
+    lines = list(inv.get("Line") or [])
+    if not lines or _ref_id_missing(default_item):
+        return
+    tax_raw = duplicate_check.get("tax")
+    total_raw = duplicate_check.get("total")
+    sub_raw = duplicate_check.get("subtotal")
+    if tax_raw is None or total_raw is None:
+        return
+    try:
+        tax_amt = float(tax_raw)
+        total_amt = float(total_raw)
+    except (TypeError, ValueError):
+        return
+    if tax_amt <= 0 or total_amt <= 0:
+        return
+    if any(_description_suggests_tax_line(str((line or {}).get("Description") or "")) for line in lines):
+        return
+    line_sum = _line_sum_amounts(lines)
+    if sub_raw is not None:
+        try:
+            sub_amt = float(sub_raw)
+        except (TypeError, ValueError):
+            sub_amt = line_sum
+        if abs(line_sum - sub_amt) > 0.06:
+            return
+    if abs(line_sum + tax_amt - total_amt) > 0.06:
+        return
+    lines.append(_as_sales_item_line("Sales tax (from email)", tax_amt, default_item))
+    inv["Line"] = lines
+
+
 def build_bill_payload_from_email(
     email: Dict[str, Any],
     parsed: Dict[str, Any],
@@ -661,9 +751,11 @@ def build_bill_payload_from_email(
     default_item = _default_item_ref(items)
     body_rows = _extract_line_items_from_body(body)
     llm_lines = bill.get("Line") or []
+    used_body_lines = bool(body_rows and not llm_lines)
 
-    if body_rows and not llm_lines:
+    if used_body_lines:
         bill["Line"] = _lines_from_body_with_items(body_rows, account_ref, items, default_item)
+        _append_bill_tax_line_from_hints(bill, duplicate_check, account_ref)
         if not rationale:
             rationale = "Line items built from email body (LLM returned no lines)."
 
@@ -707,6 +799,7 @@ def build_invoice_payload_from_email(
 
     if body_rows and not llm_lines:
         inv["Line"] = _lines_from_body_for_invoice(body_rows, items, default_item)
+        _append_invoice_tax_line_from_hints(inv, duplicate_check, default_item)
         if not rationale:
             rationale = "Line items built from email body (LLM returned no lines)."
 
