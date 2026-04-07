@@ -244,6 +244,8 @@ def parse_invoice_node(state: GraphState) -> GraphState:
         "3) Use SalesItemLineDetail.ItemRef from provided items.\n"
         "3b) reference.customers and reference.items list every customer and item from QuickBooks; use only those Ids.\n"
         "4) Use email_body_text for line items and amounts when the structured email fields are sparse.\n"
+        "4b) Ignore Open Balance, Previous Balance, Balance forward, aging/statement balance, and any "
+        "AR history — never add those as Line items; only charges for this invoice.\n"
         "5) Tax / VAT / GST: If the email shows tax as a separate amount, add a Line: "
         "use a reference item that represents tax/fees if one exists; otherwise pick the "
         "closest generic item and set Description to the tax label from the email "

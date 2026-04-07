@@ -210,6 +210,7 @@ def _account_eligible_for_bill_expense_reference(row: Dict[str, Any]) -> bool:
 
 
 def compact_qb_customer_for_llm(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Identity fields only — no Balance / OpenBalance (avoids conflating AR history with this invoice)."""
     out: Dict[str, Any] = {}
     for key in ("Id", "DisplayName", "CompanyName", "FullyQualifiedName", "Active"):
         if key in row and row[key] is not None:
@@ -246,6 +247,7 @@ def build_invoice_llm_reference(
     return {
         "items": [compact_qb_item_for_llm(i) for i in items if isinstance(i, dict)],
         "customers": [compact_qb_customer_for_llm(c) for c in customers if isinstance(c, dict)],
+        "customers_note": "Customer rows omit open balances and balances — match CustomerRef by identity only.",
     }
 
 
@@ -264,16 +266,40 @@ def detect_bill_duplicate(bill: Dict[str, Any], existing_bills: List[Dict[str, A
 
 
 def detect_invoice_duplicate(invoice: Dict[str, Any], existing_invoices: List[Dict[str, Any]]) -> bool:
-    doc = invoice.get("DocNumber")
+    """
+    Match a specific invoice identity only — not "same customer + same total", which would treat
+    unrelated invoices as duplicates (aggregating distinct bills into one duplicate hit).
+    """
+    doc = str(invoice.get("DocNumber") or "").strip()
     customer = (invoice.get("CustomerRef") or {}).get("value")
-    amount = sum((line or {}).get("Amount", 0) for line in invoice.get("Line", []))
+    txn_date = invoice.get("TxnDate")
+    try:
+        amount = sum(float((line or {}).get("Amount", 0) or 0) for line in invoice.get("Line", []))
+    except (TypeError, ValueError):
+        amount = 0.0
+
     for existing in existing_invoices:
-        same_doc = existing.get("DocNumber") == doc if doc else False
-        same_customer = ((existing.get("CustomerRef") or {}).get("value") == customer)
-        existing_total = existing.get("TotalAmt")
-        same_amount = existing_total is not None and abs(float(existing_total) - float(amount)) < 0.01
-        if same_doc or (same_customer and same_amount):
-            return True
+        ex_doc = str(existing.get("DocNumber") or "").strip()
+        ex_cust = (existing.get("CustomerRef") or {}).get("value")
+
+        if doc and ex_doc == doc:
+            if customer is None or ex_cust is None or customer == ex_cust:
+                return True
+            continue
+
+        if not doc:
+            existing_total = existing.get("TotalAmt")
+            try:
+                same_amount = (
+                    existing_total is not None and abs(float(existing_total) - float(amount)) < 0.01
+                )
+            except (TypeError, ValueError):
+                same_amount = False
+            same_customer = customer is not None and ex_cust == customer
+            same_date = bool(txn_date) and existing.get("TxnDate") == txn_date
+            if same_customer and same_amount and same_date:
+                return True
+
     return False
 
 
@@ -343,6 +369,7 @@ def _is_summary_or_header_line(stripped: str) -> bool:
     for lower in candidates:
         if re.match(
             r"^(subtotal|tax\b|vat\b|gst\b|sales\s+tax|total\b|amount\s+due|balance\s+due|grand\s+total|"
+            r"open\s+balance|previous\s+balance|prior\s+balance|balance\s+forward|"
             r"invoice\s*#|date\b|due\s+date|bill\s+date|invoice\s+date|payment\s+due)\b",
             lower,
         ):
@@ -357,6 +384,55 @@ def _is_summary_or_header_line(stripped: str) -> bool:
     if len(stripped) < 3:
         return True
     return False
+
+
+def _description_looks_like_open_balance_row(desc: str) -> bool:
+    """AR statement rows — not part of the current invoice charges."""
+    inner = _strip_markdown_wrapping(desc).lower()
+    if re.search(r"\bopen\s+balance\b", inner):
+        return True
+    if re.search(r"\b(previous|prior)\s+balance\b", inner):
+        return True
+    if re.match(r"^balance\s+forward\b", inner):
+        return True
+    if re.search(r"\baging\s+balance\b", inner):
+        return True
+    if re.search(r"\bstatement\s+balance\b", inner) and "due" not in inner:
+        return True
+    return False
+
+
+def _invoice_line_description(line: Dict[str, Any]) -> str:
+    if not isinstance(line, dict):
+        return ""
+    d = line.get("Description")
+    if d is not None and str(d).strip():
+        return str(d).strip()
+    det = line.get("SalesItemLineDetail") or {}
+    if isinstance(det, dict):
+        d2 = det.get("Description")
+        if d2 is not None and str(d2).strip():
+            return str(d2).strip()
+    return ""
+
+
+def _strip_open_balance_invoice_lines(inv: Dict[str, Any]) -> bool:
+    lines_in = inv.get("Line")
+    if not isinstance(lines_in, list):
+        return False
+    kept: List[Dict[str, Any]] = []
+    removed = False
+    for line in lines_in:
+        if not isinstance(line, dict):
+            continue
+        desc = _invoice_line_description(line)
+        if _description_looks_like_open_balance_row(desc):
+            removed = True
+            continue
+        kept.append(line)
+    if removed:
+        inv["Line"] = kept
+    return removed
 
 
 def _description_looks_like_bill_metadata_row(desc: str) -> bool:
@@ -384,6 +460,8 @@ def _extract_line_items_from_body(text: str) -> List[Dict[str, Any]]:
         if _is_summary_or_header_line(desc):
             return
         if _description_looks_like_bill_metadata_row(desc):
+            return
+        if _description_looks_like_open_balance_row(desc):
             return
         if amount is None or amount <= 0 or amount > 1e12:
             return
@@ -1400,9 +1478,15 @@ def build_invoice_payload_from_email(
 
     if body_rows and not llm_lines:
         inv["Line"] = _lines_from_body_for_invoice(body_rows, items, default_item)
-        _append_invoice_tax_line_from_hints(inv, duplicate_check, default_item)
         if not rationale:
             rationale = "Line items built from email body (LLM returned no lines)."
+
+    if _strip_open_balance_invoice_lines(inv):
+        note = "Removed Open Balance / prior-balance rows (not current invoice line items)."
+        rationale = f"{rationale} {note}".strip() if rationale else note
+
+    if body_rows and not llm_lines:
+        _append_invoice_tax_line_from_hints(inv, duplicate_check, default_item)
 
     inv = _drop_none_values(inv)
     return {"invoice": inv, "duplicate_check": duplicate_check, "rationale": rationale}
