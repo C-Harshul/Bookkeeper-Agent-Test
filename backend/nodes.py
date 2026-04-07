@@ -1,5 +1,7 @@
 import os
+from typing import Any, Dict, Optional
 
+import requests
 from langchain_core.output_parsers import PydanticOutputParser
 
 from backend.models import (
@@ -11,9 +13,12 @@ from backend.models import (
 from backend.services.llm import parse_structured_output
 from backend.services.quickbooks import get_qb_client
 from backend.utils import (
+    build_bill_llm_reference,
     build_bill_payload_from_email,
     build_email_blob,
+    build_invoice_llm_reference,
     build_invoice_payload_from_email,
+    clamp_bill_agent_output_to_quickbooks,
     detect_bill_duplicate,
     detect_invoice_duplicate,
     get_email_body_text,
@@ -23,6 +28,32 @@ from backend.utils import (
     should_track_email,
     summarize_counts,
 )
+
+
+def _response_body_from_http_error(response: Optional[requests.Response]) -> Any:
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        text = (response.text or "").strip()
+        return text[:8000] if text else None
+
+
+def _quickbooks_post_attempt(
+    *,
+    resource: str,
+    request_body: Dict[str, Any],
+    http_status: int,
+    response_body: Any,
+) -> Dict[str, Any]:
+    return {
+        "resource": resource,
+        "method": "POST",
+        "requestBody": request_body,
+        "httpStatus": http_status,
+        "responseBody": response_body,
+    }
 
 
 def inspect_email_node(state: GraphState) -> GraphState:
@@ -106,10 +137,16 @@ def fetch_bill_context_node(state: GraphState) -> GraphState:
         "items": qb.get_items(),
         "vendors": qb.get_vendors(),
         "accounts": qb.get_accounts(),
+        "tax_codes": qb.get_tax_codes(),
     }
     summarize_counts(
         "fetch_bill_context",
-        {"items": next_state["items"], "vendors": next_state["vendors"], "accounts": next_state["accounts"]},
+        {
+            "items": next_state["items"],
+            "vendors": next_state["vendors"],
+            "accounts": next_state["accounts"],
+            "tax_codes": next_state["tax_codes"],
+        },
     )
     return next_state
 
@@ -134,47 +171,60 @@ def parse_bill_node(state: GraphState) -> GraphState:
 
     system_prompt = (
         "You are an Accounting AI Agent for BILL extraction only.\n"
+        "GROUNDING (non-negotiable): Only use QuickBooks data from reference.* lists returned by the API. "
+        "Every VendorRef.value, ItemRef.value, AccountRef.value, and APAccountRef.value MUST be copied "
+        "exactly from an Id in reference.vendors, reference.items (sellable rows), or reference.accounts. "
+        "Never invent, guess, or reuse Ids not shown in reference. "
+        "Line Amounts, subtotals, tax, and totals MUST match figures stated in email_body_text or email when present; "
+        "do not fabricate dollar amounts.\n"
         "Rules:\n"
         "1) Return only Bill fields in the schema.\n"
         "2) For bill line details: if matching item has expense account use "
         "ItemBasedExpenseLineDetail, otherwise use AccountBasedExpenseLineDetail.\n"
-        "3) Use VendorRef from provided vendors.\n"
+        "3) Use VendorRef only from reference.vendors Ids. If no vendor matches the email, omit VendorRef.\n"
+        "3b) reference.vendors and reference.items are the QuickBooks lists — pick Ids only from them.\n"
         "4) Use email_body_text for line items and amounts when the structured email fields are sparse.\n"
-        "5) Tax, VAT, GST, and sales tax: If the email shows a separate tax amount (e.g. "
-        "'Tax (10%): $296', 'VAT: …', 'Sales tax …'), add a separate Line with "
-        "DetailType AccountBasedExpenseLineDetail, Description matching the email "
-        "(e.g. 'Sales tax (10%)'), Amount equal to that tax dollar amount, "
-        "TaxCodeRef value 'NON', and AccountRef from a suitable expense or tax account "
-        "in reference.accounts when possible; otherwise any plausible expense AccountRef id.\n"
-        "6) Subtotal vs total: If the email gives Subtotal and Tax and Total, line items "
-        "should sum to subtotal (pre-tax) and the tax line equals the stated tax; "
-        "sum of all Line.Amount must equal the email Total (within $0.02). "
-        "If items are clearly tax-inclusive only, omit a separate tax line and note in rationale.\n"
+        "5) Dates: Set TxnDate to the vendor bill / invoice date from the email (e.g. 'Bill Date:', 'Invoice Date:'). "
+        "Set DueDate to the payment due date (e.g. 'Due Date:'). Use yyyy-mm-dd when possible; otherwise the pipeline "
+        "will normalize common formats.\n"
+        "6) Tax, VAT, GST, sales tax: NEVER add a separate expense Line for tax. QuickBooks applies tax via TaxCodeRef "
+        "on each line and company tax settings. Put only pre-tax product/service Lines; their Amounts must sum to the "
+        "email Subtotal when Subtotal is shown. Put the stated tax dollar amount in duplicate_check.tax only. "
+        "If the email only shows a Tax line without Subtotal, estimate subtotal = total - tax for duplicate_check.subtotal "
+        "and keep Line amounts consistent with that subtotal.\n"
         "7) Shipping or other fees: If the email lists separate dollar amounts, add "
         "AccountBasedExpenseLineDetail lines with matching Amounts.\n"
-        "8) duplicate_check must include when present: subtotal, tax, total (numbers) "
-        "from the email for reconciliation.\n"
+        "8) duplicate_check must include when present: subtotal, tax, total (numbers) from the email. "
+        "Subtotal + tax should equal total (within $0.02) when all three appear.\n"
         "9) Include other duplicate_check hints helpful for comparison.\n"
         f"{parser.get_format_instructions()}"
     )
 
+    reference = build_bill_llm_reference(
+        state.get("items", []),
+        state.get("vendors", []),
+        state.get("accounts", []),
+    )
     user_prompt = {
         "email": email_blob,
         "email_body_text": email_body_text,
-        "reference": {
-            "items": state.get("items", []),
-            "vendors": state.get("vendors", []),
-            "accounts": state.get("accounts", []),
-        },
+        "reference": reference,
     }
 
     parsed = parse_structured_output(parser=parser, system_prompt=system_prompt, user_payload=user_prompt)
-    merged = build_bill_payload_from_email(
-        state["email"],
+    grounded = clamp_bill_agent_output_to_quickbooks(
         parsed.model_dump(),
         items=state.get("items", []),
         vendors=state.get("vendors", []),
         accounts=state.get("accounts", []),
+    )
+    merged = build_bill_payload_from_email(
+        state["email"],
+        grounded,
+        items=state.get("items", []),
+        vendors=state.get("vendors", []),
+        accounts=state.get("accounts", []),
+        tax_codes=state.get("tax_codes", []),
     )
     log_step("parse_bill", "Bill payload parsed")
     return {**state, "parsed_bill": merged}
@@ -192,6 +242,7 @@ def parse_invoice_node(state: GraphState) -> GraphState:
         "1) Return only Invoice fields in the schema.\n"
         "2) Use CustomerRef from provided customers.\n"
         "3) Use SalesItemLineDetail.ItemRef from provided items.\n"
+        "3b) reference.customers and reference.items list every customer and item from QuickBooks; use only those Ids.\n"
         "4) Use email_body_text for line items and amounts when the structured email fields are sparse.\n"
         "5) Tax / VAT / GST: If the email shows tax as a separate amount, add a Line: "
         "use a reference item that represents tax/fees if one exists; otherwise pick the "
@@ -205,13 +256,14 @@ def parse_invoice_node(state: GraphState) -> GraphState:
         f"{parser.get_format_instructions()}"
     )
 
+    reference = build_invoice_llm_reference(
+        state.get("items", []),
+        state.get("customers", []),
+    )
     user_prompt = {
         "email": email_blob,
         "email_body_text": email_body_text,
-        "reference": {
-            "items": state.get("items", []),
-            "customers": state.get("customers", []),
-        },
+        "reference": reference,
     }
     parsed = parse_structured_output(parser=parser, system_prompt=system_prompt, user_payload=user_prompt)
     merged = build_invoice_payload_from_email(
@@ -260,18 +312,82 @@ def create_bill_node(state: GraphState) -> GraphState:
     log_step("create_bill", "Creating Bill in QuickBooks")
     qb = get_qb_client()
     payload = sanitize_bill_payload(state["parsed_bill"]["bill"], state.get("accounts", []))
-    result = qb.create_bill(payload)
+    try:
+        result = qb.create_bill(payload)
+    except requests.HTTPError as exc:
+        resp = exc.response
+        status = int(resp.status_code) if resp is not None else 0
+        body = _response_body_from_http_error(resp)
+        post = _quickbooks_post_attempt(
+            resource="bill",
+            request_body=payload,
+            http_status=status,
+            response_body=body,
+        )
+        log_step("create_bill", f"Bill POST failed httpStatus={status}")
+        return {
+            **state,
+            "result": {
+                "action": "bill_create_failed",
+                "post": post,
+                "response": body,
+                "error": str(exc),
+            },
+            "workflow_failed": True,
+            "workflow_failure_reason": f"create_bill: {exc}",
+        }
     log_step("create_bill", f"Bill created successfully. Response keys={list(result.keys())}")
-    return {**state, "result": {"action": "bill_created", "response": result}}
+    post = _quickbooks_post_attempt(
+        resource="bill",
+        request_body=payload,
+        http_status=200,
+        response_body=result,
+    )
+    return {
+        **state,
+        "result": {"action": "bill_created", "post": post, "response": result},
+    }
 
 
 def create_invoice_node(state: GraphState) -> GraphState:
     log_step("create_invoice", "Creating Invoice in QuickBooks")
     qb = get_qb_client()
     payload = state["parsed_invoice"]["invoice"]
-    result = qb.create_invoice(payload)
+    try:
+        result = qb.create_invoice(payload)
+    except requests.HTTPError as exc:
+        resp = exc.response
+        status = int(resp.status_code) if resp is not None else 0
+        body = _response_body_from_http_error(resp)
+        post = _quickbooks_post_attempt(
+            resource="invoice",
+            request_body=payload,
+            http_status=status,
+            response_body=body,
+        )
+        log_step("create_invoice", f"Invoice POST failed httpStatus={status}")
+        return {
+            **state,
+            "result": {
+                "action": "invoice_create_failed",
+                "post": post,
+                "response": body,
+                "error": str(exc),
+            },
+            "workflow_failed": True,
+            "workflow_failure_reason": f"create_invoice: {exc}",
+        }
     log_step("create_invoice", f"Invoice created successfully. Response keys={list(result.keys())}")
-    return {**state, "result": {"action": "invoice_created", "response": result}}
+    post = _quickbooks_post_attempt(
+        resource="invoice",
+        request_body=payload,
+        http_status=200,
+        response_body=result,
+    )
+    return {
+        **state,
+        "result": {"action": "invoice_created", "post": post, "response": result},
+    }
 
 
 def no_action_node(state: GraphState) -> GraphState:

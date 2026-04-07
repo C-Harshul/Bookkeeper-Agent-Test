@@ -36,9 +36,12 @@ Create `.env` in the **project root** (same folder as `backend/` and `main.py`).
 | `QB_MINOR_VERSION` | API minor version (default `69`) |
 | `QB_DEFAULT_EXPENSE_ACCOUNT_ID` | Optional: default account id for bill lines missing `AccountRef` |
 | `QB_DEFAULT_INVOICE_ITEM_ID` | Optional: preferred QuickBooks **Item** id for invoice lines built from the email body (must not be a Category-type item) |
-| `LLM_PROVIDER` | `gemini` or `ollama` |
+| `LLM_PROVIDER` | `ollama` (default) or `gemini` |
+| `OLLAMA_MODEL` | e.g. `qwen2.5:7b` (when using Ollama) |
+| `OLLAMA_BASE_URL` | Optional; set if Ollama is not on `localhost:11434` |
+| `LLM_MAX_PAYLOAD_CHARS` | Optional (Ollama): max JSON size for the LLM user message (default `48000`). Truncation **prefers keeping all items and vendors** and shortens **accounts** first, then items, then vendors only if needed |
 | `GOOGLE_API_KEY` | Required if `LLM_PROVIDER=gemini` |
-| `GEMINI_MODEL` | e.g. `gemini-2.5-flash` |
+| `GEMINI_MODEL` | e.g. `gemini-2.5-flash` (when using Gemini) |
 | `TRACK_EMAIL` | If **empty**, all emails pass the inspect filter. If **unset**, code defaults to `numinatest2@gmail.com` — set `TRACK_EMAIL=` explicitly to allow any sender for real Gmail. |
 | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` | Google OAuth client |
 | `GMAIL_REDIRECT_URI` | Full callback URL (e.g. `http://localhost:5173/gmail-callback`) — must match Google Console **exactly** |

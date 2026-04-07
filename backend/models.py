@@ -70,6 +70,7 @@ class BillPayload(BaseModel):
     VendorRef: Optional[VendorRefModel] = None
     APAccountRef: Optional[AccountRefModel] = None
     TxnDate: Optional[str] = None
+    GlobalTaxCalculation: Optional[str] = None
     CurrencyRef: Optional[CurrencyRefModel] = Field(default_factory=CurrencyRefModel)
     Line: List[BillLine] = Field(default_factory=list)
 
@@ -110,6 +111,7 @@ class GraphState(TypedDict, total=False):
     customers: List[Dict[str, Any]]
     vendors: List[Dict[str, Any]]
     accounts: List[Dict[str, Any]]
+    tax_codes: List[Dict[str, Any]]
     parsed_bill: Dict[str, Any]
     parsed_invoice: Dict[str, Any]
     duplicate_found: bool

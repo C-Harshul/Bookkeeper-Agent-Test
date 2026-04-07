@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 import requests
 
@@ -138,6 +138,35 @@ class QuickBooksClient:
             params={"minorversion": self.minor_version, "query": sql},
         )
 
+    @staticmethod
+    def _query_rows(query_response_block: Dict[str, Any], entity_key: str) -> List[Dict[str, Any]]:
+        """QBO returns one entity as a dict and many as a list; normalize to a list of dicts."""
+        raw = query_response_block.get(entity_key)
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [cast(Dict[str, Any], x) for x in raw if isinstance(x, dict)]
+        if isinstance(raw, dict):
+            return [raw]
+        return []
+
+    def _query_all_pages(self, entity: str, *, page_size: int = 1000) -> List[Dict[str, Any]]:
+        """Paginate QBO queries (default max 1000 rows per request)."""
+        all_rows: List[Dict[str, Any]] = []
+        start = 1
+        while True:
+            sql = f"select * from {entity} STARTPOSITION {start} MAXRESULTS {page_size}"
+            data = self._query(sql)
+            block = data.get("QueryResponse") or {}
+            rows = self._query_rows(block, entity)
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if len(rows) < page_size:
+                break
+            start += page_size
+        return all_rows
+
     def _post(self, resource: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request(
             method="POST",
@@ -147,28 +176,25 @@ class QuickBooksClient:
         )
 
     def get_bills(self) -> List[Dict[str, Any]]:
-        data = self._query("select * from Bill")
-        return data.get("QueryResponse", {}).get("Bill", [])
+        return self._query_all_pages("Bill")
 
     def get_invoices(self) -> List[Dict[str, Any]]:
-        data = self._query("select * from Invoice")
-        return data.get("QueryResponse", {}).get("Invoice", [])
+        return self._query_all_pages("Invoice")
 
     def get_items(self) -> List[Dict[str, Any]]:
-        data = self._query("select * from Item")
-        return data.get("QueryResponse", {}).get("Item", [])
+        return self._query_all_pages("Item")
 
     def get_customers(self) -> List[Dict[str, Any]]:
-        data = self._query("select * from Customer")
-        return data.get("QueryResponse", {}).get("Customer", [])
+        return self._query_all_pages("Customer")
 
     def get_vendors(self) -> List[Dict[str, Any]]:
-        data = self._query("select * from Vendor")
-        return data.get("QueryResponse", {}).get("Vendor", [])
+        return self._query_all_pages("Vendor")
 
     def get_accounts(self) -> List[Dict[str, Any]]:
-        data = self._query("select * from Account")
-        return data.get("QueryResponse", {}).get("Account", [])
+        return self._query_all_pages("Account")
+
+    def get_tax_codes(self) -> List[Dict[str, Any]]:
+        return self._query_all_pages("TaxCode")
 
     def validate_auth(self) -> Dict[str, Any]:
         data = self._query("select * from CompanyInfo")

@@ -5,7 +5,12 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from backend.graph import NODE_REGISTRY
 from backend.models import GraphState
-from backend.utils import build_email_blob, get_email_body_text
+from backend.utils import (
+    build_bill_llm_reference,
+    build_email_blob,
+    build_invoice_llm_reference,
+    get_email_body_text,
+)
 
 
 def _timestamp() -> str:
@@ -111,16 +116,20 @@ def _extract_node_input(base: str, state: GraphState) -> Dict[str, Any]:
         body = get_email_body_text(email) or ""
         return {
             "email_body_preview": body[:800],
-            "items_count": len(state.get("items", [])),
-            "vendors_count": len(state.get("vendors", [])),
-            "accounts_count": len(state.get("accounts", [])),
+            "reference": build_bill_llm_reference(
+                state.get("items", []),
+                state.get("vendors", []),
+                state.get("accounts", []),
+            ),
         }
     if base == "parse_invoice":
         body = get_email_body_text(email) or ""
         return {
             "email_body_preview": body[:800],
-            "items_count": len(state.get("items", [])),
-            "customers_count": len(state.get("customers", [])),
+            "reference": build_invoice_llm_reference(
+                state.get("items", []),
+                state.get("customers", []),
+            ),
         }
     if base == "fetch_existing_bills":
         return {}
@@ -152,6 +161,7 @@ def _extract_node_output(base: str, state: GraphState) -> Dict[str, Any]:
             "vendors_count": len(state.get("vendors", [])),
             "items_count": len(state.get("items", [])),
             "accounts_count": len(state.get("accounts", [])),
+            "tax_codes_count": len(state.get("tax_codes", [])),
             "vendors_sample": state.get("vendors", [])[:2],
             "items_sample": state.get("items", [])[:2],
         }
@@ -163,7 +173,14 @@ def _extract_node_output(base: str, state: GraphState) -> Dict[str, Any]:
             "items_sample": state.get("items", [])[:2],
         }
     if base == "parse_bill":
-        return {"parsed_bill": state.get("parsed_bill", {})}
+        return {
+            "parsed_bill": state.get("parsed_bill", {}),
+            "reference": build_bill_llm_reference(
+                state.get("items", []),
+                state.get("vendors", []),
+                state.get("accounts", []),
+            ),
+        }
     if base == "parse_invoice":
         return {"parsed_invoice": state.get("parsed_invoice", {})}
     if base == "fetch_existing_bills":
@@ -216,6 +233,12 @@ def execute_workflow_from_graph(
                     "workflow_failure_reason": f"{base}: {exc}",
                 }
                 err = {"timestamp": _timestamp(), "level": "ERROR", "message": str(exc)}
+                node_logs.setdefault(current, []).append(err)
+                execution_order.append({"nodeId": current, "status": "failed"})
+                break
+            if state.get("workflow_failed"):
+                reason = state.get("workflow_failure_reason", "workflow_failed")
+                err = {"timestamp": _timestamp(), "level": "ERROR", "message": reason}
                 node_logs.setdefault(current, []).append(err)
                 execution_order.append({"nodeId": current, "status": "failed"})
                 break
@@ -293,6 +316,23 @@ def stream_workflow_from_graph(
                     "log": {"level": "ERROR", "message": f"Failed {base}: {exc}"},
                     "input": node_input,
                     "error": str(exc),
+                }
+                break
+            if state.get("workflow_failed"):
+                reason = state.get("workflow_failure_reason", "workflow_failed")
+                yield {
+                    "event": "node_failed",
+                    "timestamp": _timestamp(),
+                    "nodeId": current,
+                    "log": {"level": "ERROR", "message": reason},
+                    "input": node_input,
+                    "error": reason,
+                    "output": _trim_output(_extract_node_output(base, state)),
+                    "state": {
+                        "action": state.get("action"),
+                        "duplicate_found": state.get("duplicate_found"),
+                        "result": state.get("result"),
+                    },
                 }
                 break
             yield {
