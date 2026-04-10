@@ -8,7 +8,7 @@ LangGraph workflow that ingests email-like payloads, classifies them as **bill**
 |------|---------|
 | `backend/` | LangGraph nodes, QuickBooks + Gmail services, FastAPI API |
 | `main.py` | CLI: runs sample email through `run_once()` |
-| `Accounting-Orchestrator/` | React + Vite + React Flow UI (live streaming runs, OAuth sidebars); **nested git repo** — if the folder is empty after clone, run `git submodule update --init --recursive` (or `cd Accounting-Orchestrator && git fetch && git checkout` the commit shown by `git ls-tree HEAD Accounting-Orchestrator` in the parent repo). |
+| `Accounting-Orchestrator/` | React + Vite + React Flow UI (live streaming runs, OAuth sidebars); tracked in this repository — run `npm install` after clone. |
 | `.env.example` | Template for environment variables (copy to `.env`) |
 
 ## 1) Python backend
