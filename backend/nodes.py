@@ -13,6 +13,7 @@ from backend.models import (
 from backend.services.llm import parse_structured_output
 from backend.services.quickbooks import get_qb_client
 from backend.utils import (
+    body_has_strong_classification_signal,
     build_bill_llm_reference,
     build_bill_payload_from_email,
     build_email_blob,
@@ -103,9 +104,11 @@ def classify_email_node(state: GraphState) -> GraphState:
     system_prompt = (
         "You classify accounting emails.\n"
         "Return action in {'bill','invoice','no_action'} only.\n"
-        "Use no_action for unrelated emails.\n"
+        "Use no_action for unrelated, ambiguous, or weak-signal emails.\n"
         "Prefer 'bill' for amounts owed to suppliers/vendors (accounts payable). "
         "Prefer 'invoice' for sales/customer-facing invoices (accounts receivable).\n"
+        "If evidence is weak (e.g. generic mention of invoice/bill without document fields like "
+        "invoice number/date, due date, subtotal/tax/total), choose no_action.\n"
         f"{parser.get_format_instructions()}"
     )
     try:
@@ -121,11 +124,17 @@ def classify_email_node(state: GraphState) -> GraphState:
             "action": "no_action",
             "rationale": f"classification_error:{exc}",
         }
-    log_step("classify_email", f"Classified action={classified.action}")
+    action = classified.action
+    rationale = classified.rationale or ""
+    if action in ("bill", "invoice") and not body_has_strong_classification_signal(body_text):
+        log_step("classify_email", f"Weak evidence for action={action}; overriding to no_action")
+        action = "no_action"
+        rationale = f"{rationale} weak_signal_override".strip()
+    log_step("classify_email", f"Classified action={action}")
     return {
         **state,
-        "action": classified.action,
-        "rationale": classified.rationale or "",
+        "action": action,
+        "rationale": rationale,
     }
 
 

@@ -68,6 +68,31 @@ def _body_suggests_vendor_payable(body: str) -> bool:
     return any(m in t for m in markers)
 
 
+def body_has_strong_classification_signal(body: str) -> bool:
+    """Conservative gate: only classify bill/invoice when strong document cues exist."""
+    t = re.sub(r"[\u200b\u200c\ufeff]", "", (body or "").lower())
+    if not t.strip():
+        return False
+
+    strong_doc_markers = (
+        r"\binvoice\s*(#|number|no\.?|date)\b",
+        r"\bbill\s*(#|number|date)\b",
+        r"\bdue\s+date\b",
+        r"\bamount\s+due\b",
+        r"\bbalance\s+due\b",
+        r"\bsubtotal\b",
+        r"\bpo\s*(#|number)\b",
+        r"\baccounts\s+payable\b",
+    )
+    if any(re.search(pat, t, re.I) for pat in strong_doc_markers):
+        return True
+
+    # Require explicit invoice/bill wording plus an amount-like value.
+    has_invoice_or_bill = bool(re.search(r"\b(invoice|bill)\b", t, re.I))
+    has_amount = bool(re.search(r"\$?\s*[0-9][0-9,]*(?:\.\d{1,2})\b", t))
+    return has_invoice_or_bill and has_amount
+
+
 def quick_classify_email_body(body: str) -> Optional[Tuple[str, str]]:
     raw = (body or "").strip()
     if not raw:
@@ -79,9 +104,9 @@ def quick_classify_email_body(body: str) -> Optional[Tuple[str, str]]:
             "Body contains vendor/bill-style language (payments owed to a supplier); classified as bill.",
         )
     invoice_patterns = [
-        r"\binvoice\b",
         r"\binvoice\s*#",
         r"\binvoice\s+number",
+        r"\binvoice\s+no\.?\b",
         r"\binvoice\s+date",
         r"\bsales\s+invoice\b",
         r"\bcustomer\s+invoice\b",
@@ -94,7 +119,7 @@ def quick_classify_email_body(body: str) -> Optional[Tuple[str, str]]:
         if re.search(pat, body, re.I):
             return (
                 "invoice",
-                "The body contains invoice-style wording (e.g. 'Invoice' or invoice number/date); "
+                "The body contains strong invoice-document cues (e.g. invoice number/date); "
                 "classified as customer/sales invoice (accounts receivable).",
             )
     return None
